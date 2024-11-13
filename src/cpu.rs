@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::cpu_types::{AddressingMode, Operation, CpuFlag, STACK_RESET};
+use crate::cpu_types::{AddressingMode, Operation, CpuFlag, STACK_RESET, STACK};
 use crate::instruction::{Instruction, INSTRUCTIONS_MAP};
 
 pub struct CPU {
@@ -71,6 +71,17 @@ impl CPU {
                 let base = self.mem_read_u16(self.program_counter);
                 base.wrapping_add(self.register_x as u16)
             }
+            AddressingMode::Indirect => {
+                let base = self.mem_read_u16(self.program_counter);
+                let indirect_ref = if base & 0x00FF == 0x00FF {
+                    let lo = self.mem_read(base);
+                    let hi = self.mem_read(base & 0xFF00);
+                    (hi as u16) << 8 | (lo as u16)
+                } else {
+                    self.mem_read_u16(base)
+                };
+                indirect_ref
+            }
             AddressingMode::AbsoluteY => {
                 let base = self.mem_read_u16(self.program_counter);
                 base.wrapping_add(self.register_y as u16)
@@ -89,10 +100,36 @@ impl CPU {
                 let deref_base = (hi as u16) << 8 | (lo as u16);
                 deref_base.wrapping_add(self.register_y as u16)
             }
-            AddressingMode::NoneAddressing => {
-                panic!("Mode NoneAddressing not supported");
+            AddressingMode::Implied => 0,
+            AddressingMode::Relative => 0,
+            AddressingMode::Accumulator => 0,
+            _ => {
+                panic!("Mode not supported");
             }
         }
+    }
+
+    fn stack_pop(&mut self) -> u8 {
+        self.stack_pointer = self.stack_pointer.wrapping_add(1);
+        self.mem_read(STACK + self.stack_pointer as u16)
+    }
+
+    fn stack_push(&mut self, data: u8) {
+        self.mem_write(STACK + self.stack_pointer as u16, data);
+        self.stack_pointer = self.stack_pointer.wrapping_sub(1)
+    }
+
+    fn stack_push_u16(&mut self, data: u16) {
+        let hi = (data >> 8) as u8;
+        let lo = (data & 0xff) as u8;
+        self.stack_push(hi);
+        self.stack_push(lo);
+    }
+
+    fn stack_pop_u16(&mut self) -> u16 {
+        let lo = self.stack_pop() as u16;
+        let hi = self.stack_pop() as u16;
+        hi << 8 | lo
     }
 
     // Ignoring decimal mode
@@ -137,19 +174,20 @@ impl CPU {
         self.update_zero_and_negative_flags(self.register_a);
     }
 
-    fn asl(&mut self, mode: &AddressingMode) {
+    fn asl(&mut self, mode: &AddressingMode) -> u8 {
         let mut data;
         let addr;
 
         // Determine whether to operate on the accumulator or memory
-        if let AddressingMode::NoneAddressing = mode {
-            // ASL on the accumulator
-            data = self.register_a;
-            addr = 0; // Dummy value; not used in this case
-        } else {
-            // ASL on memory
-            addr = self.get_operand_address(mode);
-            data = self.mem_read(addr);
+        match mode {
+            AddressingMode::Accumulator => {
+                data = self.register_a;
+                addr = 0;
+            }
+            _ => {
+                addr = self.get_operand_address(mode);
+                data = self.mem_read(addr);
+            }
         }
 
         if data >> 7 == 1 {
@@ -160,13 +198,17 @@ impl CPU {
 
         data <<= 1;
 
-        if let AddressingMode::NoneAddressing = mode {
-            self.register_a = data;
-        } else {
-            self.mem_write(addr, data);
+        match mode {
+            AddressingMode::Accumulator => {
+                self.register_a = data;
+                self.register_a
+            }
+            _ => {
+                self.mem_write(addr, data);
+                self.update_zero_and_negative_flags(data);
+                data
+            }
         }
-
-        self.update_zero_and_negative_flags(data);
     }
 
     fn branch(&mut self, condition: bool) {
@@ -178,6 +220,90 @@ impl CPU {
             self.program_counter = jump_addr;
         }
     }
+
+    fn bit(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let data = self.mem_read(addr);
+
+        let and = self.register_a & data;
+        if and == 0 {
+            self.status.insert(CpuFlag::ZERO);
+        } else {
+            self.status.remove(CpuFlag::ZERO);
+        }
+
+        self.status.set(CpuFlag::NEGATIVE, data & 0b10000000 > 0);
+        self.status.set(CpuFlag::OVERFLOW, data & 0b01000000 > 0);
+    }
+
+    fn compare(&mut self, mode: &AddressingMode, compare_with: u8) {
+        let addr = self.get_operand_address(mode);
+        let data = self.mem_read(addr);
+
+        if data <= compare_with {
+            self.status.insert(CpuFlag::CARRY);
+        } else {
+            self.status.remove(CpuFlag::CARRY);
+        }
+
+        self.update_zero_and_negative_flags(compare_with.wrapping_sub(data));
+    }
+
+    fn dec(&mut self, mode: &AddressingMode) -> u8 {
+        let addr = self.get_operand_address(mode);
+        let mut data = self.mem_read(addr);
+        data = data.wrapping_sub(1);
+        self.mem_write(addr, data);
+        self.update_zero_and_negative_flags(data);
+        data
+    }
+
+    fn dex(&mut self) {
+        self.register_x = self.register_x.wrapping_sub(1);
+        self.update_zero_and_negative_flags(self.register_x);
+    }
+
+    fn dey(&mut self) {
+        self.register_y = self.register_y.wrapping_sub(1);
+        self.update_zero_and_negative_flags(self.register_y);
+    }
+
+    fn eor(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let data = self.mem_read(addr);
+        self.register_a = data ^ self.register_a;
+    }
+
+    fn inc(&mut self, mode: &AddressingMode) -> u8 {
+        let addr = self.get_operand_address(mode);
+        let mut data = self.mem_read(addr);
+        data = data.wrapping_add(1);
+        self.mem_write(addr, data);
+        self.update_zero_and_negative_flags(data);
+        data
+    }
+
+    fn inx(&mut self) {
+        self.register_x = self.register_x.wrapping_add(1);
+        self.update_zero_and_negative_flags(self.register_x);
+    }
+
+    fn iny(&mut self) {
+        self.register_y = self.register_y.wrapping_add(1);
+        self.update_zero_and_negative_flags(self.register_y);
+    }
+
+    fn jmp(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        self.program_counter = addr;
+    }
+
+    fn jsr(&mut self) {
+        self.stack_push_u16(self.program_counter + 2 - 1);
+        let target_addr = self.mem_read_u16(self.program_counter);
+        self.program_counter = target_addr;
+    }
+
     fn lda(&mut self, mode: &AddressingMode) {
         let addr = self.get_operand_address(mode);
         let value = self.mem_read(addr);
@@ -185,14 +311,65 @@ impl CPU {
         self.update_zero_and_negative_flags(self.register_a);
     }
 
+    fn ldx(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let value = self.mem_read(addr);
+        self.register_x = value;
+        self.update_zero_and_negative_flags(self.register_x);
+    }
+
+    fn ldy(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let value = self.mem_read(addr);
+        self.register_y = value;
+        self.update_zero_and_negative_flags(self.register_y);
+    }
+
     fn tax(&mut self) {
         self.register_x = self.register_a;
         self.update_zero_and_negative_flags(self.register_x);
     }
 
-    fn inx(&mut self) {
-        self.register_x = self.register_x.wrapping_add(1);
-        self.update_zero_and_negative_flags(self.register_x);
+    fn lsr(&mut self, mode: &AddressingMode) -> u8 {
+        let mut data;
+        let addr;
+
+        match mode {
+            AddressingMode::Accumulator => {
+                data = self.register_a;
+                addr = 0;
+            }
+            _ => {
+                addr = self.get_operand_address(mode);
+                data = self.mem_read(addr);
+            }
+        }
+
+        if data & 1 == 1 {
+            self.status.insert(CpuFlag::CARRY);
+        } else {
+            self.status.remove(CpuFlag::CARRY);
+        }
+
+        data >>= 1;
+
+        match mode {
+            AddressingMode::Accumulator => {
+                self.register_a = data;
+                self.register_a
+            }
+            _ => {
+                self.mem_write(addr, data);
+                self.update_zero_and_negative_flags(data);
+                data
+            }
+        }
+    }
+
+    fn ora(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let data = self.mem_read(addr);
+        self.register_a = data | self.register_a;
     }
 
     pub fn reset(&mut self) {
@@ -243,39 +420,39 @@ impl CPU {
             match opcode.operation {
                 Operation::ADC => self.adc(&opcode.mode),
                 Operation::AND => self.and(&opcode.mode),
-                Operation::ASL => self.asl(&opcode.mode),
+                Operation::ASL => { self.asl(&opcode.mode); }
                 Operation::BCC => self.branch(!self.status.contains(CpuFlag::CARRY)),
                 Operation::BCS => self.branch(self.status.contains(CpuFlag::CARRY)),
                 Operation::BEQ => self.branch(self.status.contains(CpuFlag::ZERO)),
-                Operation::BIT => todo!(),
+                Operation::BIT => self.bit(&opcode.mode),
                 Operation::BMI => self.branch(self.status.contains(CpuFlag::NEGATIVE)),
                 Operation::BNE => self.branch(!self.status.contains(CpuFlag::ZERO)),
                 Operation::BPL => self.branch(!self.status.contains(CpuFlag::NEGATIVE)),
                 Operation::BRK => return,
                 Operation::BVC => self.branch(!self.status.contains(CpuFlag::OVERFLOW)),
                 Operation::BVS => self.branch(self.status.contains(CpuFlag::OVERFLOW)),
-                Operation::CLC => todo!(),
-                Operation::CLD => todo!(),
-                Operation::CLI => todo!(),
-                Operation::CLV => todo!(),
-                Operation::CMP => todo!(),
-                Operation::CPX => todo!(),
-                Operation::CPY => todo!(),
-                Operation::DEC => todo!(),
-                Operation::DEX => todo!(),
-                Operation::DEY => todo!(),
-                Operation::EOR => todo!(),
-                Operation::INC => todo!(),
+                Operation::CLC => self.status.remove(CpuFlag::CARRY),
+                Operation::CLD => self.status.remove(CpuFlag::DECIMAL),
+                Operation::CLI => self.status.remove(CpuFlag::INTERRUPT),
+                Operation::CLV => self.status.remove(CpuFlag::OVERFLOW),
+                Operation::CMP => self.compare(&opcode.mode, self.register_a),
+                Operation::CPX => self.compare(&opcode.mode, self.register_x),
+                Operation::CPY => self.compare(&opcode.mode, self.register_y),
+                Operation::DEC => { self.dec(&opcode.mode); }
+                Operation::DEX => self.dex(),
+                Operation::DEY => self.dey(),
+                Operation::EOR => self.eor(&opcode.mode),
+                Operation::INC => { self.inc(&opcode.mode); }
                 Operation::INX => self.inx(),
-                Operation::INY => todo!(),
-                Operation::JMP => todo!(),
-                Operation::JSR => todo!(),
+                Operation::INY => self.iny(),
+                Operation::JMP => self.jmp(&opcode.mode),
+                Operation::JSR => self.jsr(),
                 Operation::LDA => self.lda(&opcode.mode),
-                Operation::LDX => todo!(),
-                Operation::LDY => todo!(),
-                Operation::LSR => todo!(),
-                Operation::NOP => todo!(),
-                Operation::ORA => todo!(),
+                Operation::LDX => self.ldx(&opcode.mode),
+                Operation::LDY => self.ldy(&opcode.mode),
+                Operation::LSR => { self.lsr(&opcode.mode); },
+                Operation::NOP => {},
+                Operation::ORA => self.ora(&opcode.mode),
                 Operation::PHA => todo!(),
                 Operation::PHP => todo!(),
                 Operation::PLA => todo!(),

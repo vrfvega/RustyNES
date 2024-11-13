@@ -8,15 +8,19 @@ pub enum Operation {
 }
 
 pub enum AddressingMode {
+    Accumulator,
     Immediate,
+    Implied,
     ZeroPage,
     ZeroPageX,
     ZeroPageY,
     Absolute,
     AbsoluteX,
     AbsoluteY,
+    Indirect,
     IndirectX,
     IndirectY,
+    Relative,
     NoneAddressing,
 }
 
